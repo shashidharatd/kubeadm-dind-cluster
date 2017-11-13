@@ -566,8 +566,9 @@ function dind::run {
          -d --privileged \
          --net kubeadm-dind-net \
          --name "${container_name}" \
-         --hostname "${container_name}" \
+         --hostname "${container_name/${CLUSTER_NAME}-/kube-}" \
          -l mirantis.kubeadm_dind_cluster \
+         -l ${CLUSTER_NAME} \
          -v ${volume_name}:/dind \
          ${opts[@]+"${opts[@]}"} \
          "${DIND_IMAGE}" \
@@ -612,9 +613,9 @@ function dind::configure-kubectl {
       host="[::1]"
     fi
   fi
-  "${kubectl}" config set-cluster dind --server="http://${host}:${APISERVER_PORT}" --insecure-skip-tls-verify=true
-  "${kubectl}" config set-context dind --cluster=dind
-  "${kubectl}" config use-context dind
+  "${kubectl}" config set-cluster ${CLUSTER_NAME} --server="http://${host}:8080" --insecure-skip-tls-verify=true
+  "${kubectl}" config set-context ${CLUSTER_NAME} --cluster=${CLUSTER_NAME}
+  "${kubectl}" config use-context ${CLUSTER_NAME}
 }
 
 force_make_binaries=
@@ -622,9 +623,9 @@ function dind::set-master-opts {
   master_opts=()
   if [[ ${BUILD_KUBEADM} || ${BUILD_HYPERKUBE} ]]; then
     # share binaries pulled from the build container between nodes
-    dind::ensure-volume "dind-k8s-binaries"
+    dind::ensure-volume "dind-k8s-binaries-${CLUSTER_NAME}"
     dind::set-build-volume-args
-    master_opts+=("${build_volume_args[@]}" -v dind-k8s-binaries:/k8s)
+    master_opts+=("${build_volume_args[@]}" -v dind-k8s-binaries-${CLUSTER_NAME}:/k8s)
     local -a bins
     if [[ ${BUILD_KUBEADM} ]]; then
       master_opts+=(-e KUBEADM_SOURCE=build://)
@@ -671,7 +672,7 @@ function dind::deploy-dashboard {
 function dind::at-least-kubeadm-1-8 {
   # kubeadm 1.6 and below doesn't support 'version -o short' and will
   # thus produce an empty string
-  local ver="$(docker exec kube-master kubeadm version -o short 2>/dev/null|sed 's/^\(v[0-9]*\.[0-9]*\).*$/\1/')"
+  local ver="$(docker exec ${CLUSTER_NAME}-master kubeadm version -o short 2>/dev/null|sed 's/^\(v[0-9]*\.[0-9]*\).*$/\1/')"
   if [[ ! ${ver} || ${ver} = v1.7 ]]; then
     return 1
   fi
@@ -684,7 +685,7 @@ function dind::init {
   if [[ ${IP_MODE} = "ipv6" ]]; then
       local_host="[::1]"
   fi
-  local container_id=$(dind::run kube-master "${kube_master_ip}" 1 ${local_host}:${APISERVER_PORT}:8080 ${master_opts[@]+"${master_opts[@]}"})
+  local container_id=$(dind::run ${CLUSTER_NAME}-master "${kube_master_ip}" 1 ${local_host}:${APISERVER_PORT}:8080 ${master_opts[@]+"${master_opts[@]}"})
   # FIXME: I tried using custom tokens with 'kubeadm ex token create' but join failed with:
   # 'failed to parse response as JWS object [square/go-jose: compact JWS format must have three parts]'
   # So we just pick the line from 'kubeadm init' output
@@ -703,7 +704,7 @@ function dind::init {
     if [[ ${IP_MODE} = "ipv6" ]]; then
 	bind_address="::"
     fi
-    docker exec -i kube-master /bin/sh -c "cat >/etc/kubeadm.conf" <<EOF
+    docker exec -i ${CLUSTER_NAME}-master /bin/sh -c "cat >/etc/kubeadm.conf" <<EOF
 apiVersion: kubeadm.k8s.io/v1alpha1
 unifiedControlPlaneImage: mirantis/hypokube:final
 kind: MasterConfiguration
@@ -736,11 +737,11 @@ function dind::create-node-container {
   # if there's just one node currently, it's master, thus we need to use
   # kube-node-1 hostname, if there are two nodes, we should pick
   # kube-node-2 and so on
-  local next_node_index=${1:-$(docker ps -q --filter=label=mirantis.kubeadm_dind_cluster | wc -l | sed 's/^ *//g')}
+  local next_node_index=${1:-$(docker ps -q --filter=label=${CLUSTER_NAME} | wc -l | sed 's/^ *//g')}
   local node_ip="${dind_ip_base}$((next_node_index + 2))"
   local -a opts
   if [[ ${BUILD_KUBEADM} || ${BUILD_HYPERKUBE} ]]; then
-    opts+=(-v dind-k8s-binaries:/k8s)
+    opts+=(-v dind-k8s-binaries-${CLUSTER_NAME}:/k8s)
     if [[ ${BUILD_KUBEADM} ]]; then
       opts+=(-e KUBEADM_SOURCE=build://)
     fi
@@ -748,7 +749,7 @@ function dind::create-node-container {
       opts+=(-e HYPERKUBE_SOURCE=build://)
     fi
   fi
-  dind::run ${reuse_volume} kube-node-${next_node_index} ${node_ip} $((next_node_index + 1)) "" ${opts[@]+"${opts[@]}"}
+  dind::run ${reuse_volume} ${CLUSTER_NAME}-node-${next_node_index} ${node_ip} $((next_node_index + 1)) "" ${opts[@]+"${opts[@]}"}
 }
 
 function dind::join {
@@ -765,7 +766,7 @@ function dind::accelerate-kube-dns {
   dind::step "Patching kube-dns deployment to make it start faster"
   # Could do this on the host, too, but we don't want to require jq here
   # TODO: do this in wrapkubeadm
-  docker exec kube-master /bin/bash -c \
+  docker exec ${CLUSTER_NAME}-master /bin/bash -c \
          "kubectl get deployment kube-dns -n kube-system -o json | jq '.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds = 3|.spec.template.spec.containers[0].readinessProbe.periodSeconds = 3' | kubectl apply --force -f -"
 }
 
@@ -889,7 +890,7 @@ function dind::up {
   else
     # FIXME: this may fail depending on k8s/kubeadm version
     # FIXME: check for taint & retry if it's there
-    "${kubectl}" taint nodes kube-master node-role.kubernetes.io/master- || true
+    "${kubectl}" taint nodes ${CLUSTER_NAME}-master node-role.kubernetes.io/master- || true
   fi
   case "${CNI_PLUGIN}" in
     bridge)
@@ -940,9 +941,9 @@ function dind::snapshot_container {
 
 function dind::snapshot {
   dind::step "Taking snapshot of the cluster"
-  dind::snapshot_container kube-master
+  dind::snapshot_container ${CLUSTER_NAME}-master
   for ((n=1; n <= NUM_NODES; n++)); do
-    dind::snapshot_container "kube-node-${n}"
+    dind::snapshot_container "${CLUSTER_NAME}-node-${n}"
   done
   dind::wait-for-ready
 }
@@ -965,7 +966,7 @@ function dind::restore {
         if [[ ${IP_MODE} = "ipv6" ]]; then
           local_host="[::1]"
         fi
-        dind::restore_container "$(dind::run -r kube-master "${kube_master_ip}" 1 ${local_host}:${APISERVER_PORT}:8080 ${master_opts[@]+"${master_opts[@]}"})"
+        dind::restore_container "$(dind::run -r ${CLUSTER_NAME}-master "${kube_master_ip}" 1 ${local_host}:${APISERVER_PORT}:8080 ${master_opts[@]+"${master_opts[@]}"})"
         dind::step "Master container restored"
       else
         dind::step "Restoring node container:" ${n}
@@ -990,26 +991,25 @@ function dind::restore {
 }
 
 function dind::down {
-  docker ps -a -q --filter=label=mirantis.kubeadm_dind_cluster | while read container_id; do
+  docker ps -a -q --filter=label=${CLUSTER_NAME} | while read container_id; do
     dind::step "Removing container:" "${container_id}"
     docker rm -fv "${container_id}"
   done
 }
 
 function dind::remove-volumes {
-  # docker 1.13+: docker volume ls -q -f label=mirantis.kubeadm_dind_cluster
-  docker volume ls -q | (grep '^kubeadm-dind' || true) | while read volume_id; do
+  docker volume ls -q -f label=mirantis.kubeadm_dind_cluster | while read volume_id; do
     dind::step "Removing volume:" "${volume_id}"
     docker volume rm "${volume_id}"
   done
 }
 
 function dind::check-for-snapshot {
-  if ! dind::volume-exists "kubeadm-dind-kube-master"; then
+  if ! dind::volume-exists "kubeadm-dind-${CLUSTER_NAME}-master"; then
     return 1
   fi
   for ((n=1; n <= NUM_NODES; n++)); do
-    if ! dind::volume-exists "kubeadm-dind-kube-node-${n}"; then
+    if ! dind::volume-exists "kubeadm-dind-${CLUSTER_NAME}-node-${n}"; then
       return 1
     fi
   done
@@ -1126,7 +1126,7 @@ function dind::step {
 function dind::dump {
   set +e
   echo "*** Dumping cluster state ***"
-  for node in $(docker ps --format '{{.Names}}' --filter label=mirantis.kubeadm_dind_cluster); do
+  for node in $(docker ps --format '{{.Names}}' --filter label=${CLUSTER_NAME}); do
     for service in kubelet.service dindnet.service criproxy.service dockershim.service; do
       if docker exec "${node}" systemctl is-enabled "${service}" >&/dev/null; then
         echo "@@@ service-${node}-${service}.log @@@"

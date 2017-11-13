@@ -1,9 +1,9 @@
 if [[ ${IP_MODE} = "ipv4" ]]; then
     # DinD subnet (expected to be /16)
-    DIND_SUBNET="10.192.0.0"
+    DIND_SUBNET=${DIND_SUBNET:-"10.192.0.0"}
 else
     # DinD subnet (expected to be /64)
-    DIND_SUBNET="fd00:10::"
+    DIND_SUBNET=${DIND_SUBNET:-"fd00:10::"}
 fi
 
 # Apiserver port
@@ -52,3 +52,6 @@ CNI_PLUGIN="${CNI_PLUGIN:-bridge}"
 # Disable parallel running of e2e tests. Use this if you use a resource
 # constrained machine for e2e tests and get some flakes.
 # DIND_NO_PARALLEL_E2E=y
+
+
+CLUSTER_NAME="${CLUSTER_NAME:-c1}"
